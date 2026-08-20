@@ -2,11 +2,14 @@
   "name": "quant-agent-frontend-mvp",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "test": "node --test --experimental-strip-types tests/*.test.mjs",
+    "eval": "node --experimental-strip-types evals/run-evals.mjs"
   },
   "dependencies": {
     "next": "15.5.23",

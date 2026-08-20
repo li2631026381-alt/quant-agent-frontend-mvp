@@ -3,82 +3,30 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   backtestSteps,
-  contractRows,
-  defaultAssumptions,
-  defaultReasons,
   defaultMessages,
   experiments,
   initialContract,
-  initialSources,
-  mockBacktestResult,
   type AgentStage,
-  type Assumption,
   type BacktestResult,
-  type ContractSource,
   type Message,
-  type StrategyContract,
 } from "@/lib/mock-data";
-import { contractFromIntent, parseIntent } from "@/lib/agent";
+import { auditContract, runBacktestTool, type BacktestAuditReport } from "@/lib/backtest";
+import type { AgentTurnResult } from "@/lib/agent";
+import {
+  contractSourceLabels,
+  createStrategyContract,
+  getContractFields,
+  getContractProgress,
+  getNextQuestion,
+  isContractReady,
+  updateContractField,
+  type ClarificationQuestion,
+  type ContractProgress,
+  type StrategyContract,
+} from "@/lib/strategy-domain";
 
 type View = "research" | "experiments" | "report" | "data";
 type InspectorTab = "contract" | "audit";
-type QuestionKey = "universe" | "rebalanceFrequency" | "executionTiming" | "positionLimit";
-
-type QuestionConfig = {
-  key: QuestionKey;
-  label: string;
-  shortLabel: string;
-  value: string;
-  description: string;
-  reason: string;
-  alternatives: string[];
-};
-
-const questionConfigs: QuestionConfig[] = [
-  {
-    key: "universe",
-    label: "股票池",
-    shortLabel: "股票池",
-    value: "沪深 300",
-    description: "你没有指定股票池。我建议先使用沪深 300 成分股，流动性较好，也能减少小盘股数据缺失对实验的影响。",
-    reason: defaultReasons.universe,
-    alternatives: ["中证 500", "全 A 股"],
-  },
-  {
-    key: "rebalanceFrequency",
-    label: "调仓周期",
-    shortLabel: "调仓",
-    value: "每月",
-    description: "你还没有指定调仓周期。我建议先采用每月调仓，降低换手率，也适合日线级别的中期研究。",
-    reason: defaultReasons.rebalanceFrequency,
-    alternatives: ["每周", "每季度"],
-  },
-  {
-    key: "executionTiming",
-    label: "执行时点",
-    shortLabel: "执行",
-    value: "收盘生成信号，下一交易日开盘执行",
-    description: "你还没有指定执行时点。我建议收盘生成信号，下一交易日开盘执行，避免使用尚未发生的信息。",
-    reason: defaultReasons.executionTiming,
-    alternatives: ["当日收盘成交", "下一交易日收盘执行"],
-  },
-  {
-    key: "positionLimit",
-    label: "仓位限制",
-    shortLabel: "仓位",
-    value: "单只股票不超过 10%",
-    description: "你还没有指定单股仓位上限。我建议先限制在 10%，降低单一标的对组合的影响。",
-    reason: defaultReasons.positionLimit,
-    alternatives: ["单只股票不超过 5%", "等权，不设额外上限"],
-  },
-];
-
-const sourceLabel: Record<ContractSource, string> = {
-  user: "用户明确",
-  agent_default: "系统默认",
-  user_override: "用户修改",
-  pending: "待确认",
-};
 
 const stageLabel: Record<AgentStage, string> = {
   idle: "待开始",
@@ -109,25 +57,13 @@ const navItems: Array<{ id: View; label: string; icon: string }> = [
   { id: "report", label: "回测报告", icon: "▥" },
 ];
 
-function nextQuestion(current: QuestionKey | null): QuestionConfig | null {
-  const index = questionConfigs.findIndex((item) => item.key === current);
-  return questionConfigs[index + 1] ?? null;
-}
-
-function fieldDisplayValue(value: string): string {
-  return value === "待确认" ? "待确认" : value.replace("推荐：", "");
-}
-
 export default function Home() {
   const [view, setView] = useState<View>("research");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>("contract");
   const [stage, setStage] = useState<AgentStage>("clarifying");
   const [contract, setContract] = useState<StrategyContract>(initialContract);
-  const [sources, setSources] = useState<Record<keyof StrategyContract, ContractSource>>(initialSources);
-  const [assumptions, setAssumptions] = useState<Assumption[]>(defaultAssumptions);
   const [messages, setMessages] = useState<Message[]>(defaultMessages);
-  const [activeQuestion, setActiveQuestion] = useState<QuestionKey | null>("universe");
   const [explanationOpen, setExplanationOpen] = useState(false);
   const [customOpen, setCustomOpen] = useState(false);
   const [customInput, setCustomInput] = useState("");
@@ -135,12 +71,12 @@ export default function Home() {
   const [input, setInput] = useState("");
   const [backtestStep, setBacktestStep] = useState(0);
   const [result, setResult] = useState<BacktestResult | null>(null);
+  const [auditReport, setAuditReport] = useState<BacktestAuditReport | null>(null);
+  const [agentBusy, setAgentBusy] = useState(false);
   const [activeExperiment, setActiveExperiment] = useState("exp-002");
 
-  const activeConfig = questionConfigs.find((item) => item.key === activeQuestion) ?? null;
-  const completedFields = Object.values(contract).filter((value) => value !== "待确认").length;
-  const totalFields = Object.keys(contract).length;
-  const progress = Math.round((completedFields / totalFields) * 100);
+  const activeConfig = getNextQuestion(contract);
+  const contractProgress = getContractProgress(contract);
   const isBacktest = stage === "backtest_running" || stage === "audit_running";
 
   useEffect(() => {
@@ -164,66 +100,60 @@ export default function Home() {
 
   useEffect(() => {
     if (stage !== "audit_running") return;
-    const timer = window.setTimeout(() => {
-      setResult(mockBacktestResult);
-      setStage("report_ready");
+    let cancelled = false;
+    void runBacktestTool(contract).then((run) => {
+      if (cancelled) return;
+      setResult(run.result);
+      setAuditReport(run.audit);
       setInspectorTab("audit");
+      if (run.status === "rejected" || !run.result) {
+        setStage("clarifying");
+        setView("research");
+        setToast("审计发现阻塞错误，请先修改策略合同");
+        return;
+      }
+      setStage("report_ready");
       setView("report");
       setToast("回测与审计完成，报告已生成");
-    }, 1100);
-    return () => window.clearTimeout(timer);
-  }, [stage]);
+    });
+    return () => { cancelled = true; };
+  }, [stage, contract]);
 
   function addMessage(message: Omit<Message, "id">) {
     setMessages((current) => [...current, { ...message, id: `${message.role}-${Date.now()}-${current.length}` }]);
   }
 
-  function updateField(key: keyof StrategyContract, value: string, source: ContractSource, reason?: string) {
-    setContract((current) => ({ ...current, [key]: value }));
-    setSources((current) => ({ ...current, [key]: source }));
-    setAssumptions((current) => {
-      const fieldLabel = contractRows.find((row) => row.key === key)?.label ?? key;
-      const next = current.filter((item) => !(item.field === fieldLabel && item.status === "active"));
-      return [
-        ...next,
-        {
-          field: fieldLabel,
-          value,
-          source: source === "pending" ? "agent_default" : source === "user" ? "user" : source,
-          reason: reason ?? "该规则来自当前策略输入。",
-          status: "active",
-        },
-      ];
-    });
+  function syncContractStage(next: StrategyContract) {
+    setStage(isContractReady(next) ? "awaiting_confirmation" : "clarifying");
   }
 
-  function pushNextQuestion(config: QuestionConfig | null) {
-    if (!config) {
-      setActiveQuestion(null);
-      setStage("awaiting_confirmation");
-      addMessage({ role: "agent", text: "策略合同已经具备可执行定义。请在右侧检查默认假设，然后确认是否开始模拟回测。", tone: "success" });
-      return;
-    }
-    setActiveQuestion(config.key);
-    addMessage({ role: "agent", text: `接下来我建议确认${config.label}。${config.description}` });
+  function nextStepText(next: StrategyContract): string {
+    const nextQuestion = getNextQuestion(next);
+    return nextQuestion
+      ? `接下来确认${nextQuestion.label}。`
+      : "策略合同已经具备可执行定义，请在右侧检查字段来源和变更记录。";
   }
 
   function acceptDefault() {
     if (!activeConfig) return;
-    updateField(activeConfig.key, activeConfig.value, "agent_default", activeConfig.reason);
+    const next = updateContractField(contract, activeConfig.key, activeConfig.value, "agent_default", activeConfig.reason);
+    setContract(next);
+    syncContractStage(next);
     setExplanationOpen(false);
     setCustomOpen(false);
     setToast(`已采用默认值：${activeConfig.value}`);
-    pushNextQuestion(nextQuestion(activeConfig.key));
+    addMessage({ role: "agent", text: `已将${activeConfig.label}记录为“${activeConfig.value}”。${nextStepText(next)}`, tone: "success" });
   }
 
   function applyCustom(value: string) {
     if (!activeConfig) return;
-    updateField(activeConfig.key, value, "user_override", `用户将 ${activeConfig.label} 修改为“${value}”。`);
+    const next = updateContractField(contract, activeConfig.key, value, "user_override", `用户将${activeConfig.label}修改为“${value}”。`);
+    setContract(next);
+    syncContractStage(next);
     setCustomOpen(false);
     setExplanationOpen(false);
     setToast(`已更新${activeConfig.label}：${value}`);
-    pushNextQuestion(nextQuestion(activeConfig.key));
+    addMessage({ role: "agent", text: `已采用你的${activeConfig.label}设置“${value}”。${nextStepText(next)}`, tone: "success" });
   }
 
   function applyCustomText() {
@@ -234,66 +164,84 @@ export default function Home() {
       return;
     }
     addMessage({ role: "user", text: `我建议${activeConfig.label}：${value}` });
-    updateField(activeConfig.key, value, "user_override", `用户自定义${activeConfig.label}：“${value}”。`);
-    addMessage({ role: "agent", text: `我会将${activeConfig.label}记录为“${value}”，并继续确认下一项。`, tone: "success" });
+    const next = updateContractField(contract, activeConfig.key, value, "user_override", `用户自定义${activeConfig.label}：“${value}”。`);
+    setContract(next);
+    syncContractStage(next);
+    addMessage({ role: "agent", text: `我会将${activeConfig.label}记录为“${value}”。${nextStepText(next)}`, tone: "success" });
     setCustomInput("");
     setCustomOpen(false);
     setExplanationOpen(false);
     setToast(`已记录你的${activeConfig.label}方案`);
-    pushNextQuestion(nextQuestion(activeConfig.key));
   }
 
   function explainDefault() {
     setExplanationOpen((current) => !current);
   }
 
-  function handleInputSubmit() {
+  async function handleInputSubmit() {
     const text = input.trim();
     if (!text) {
       setToast("先写一句你的策略想法，助手会从这里开始");
       return;
     }
     addMessage({ role: "user", text });
-    const parsed = parseIntent(text);
-    const nextContract = contractFromIntent(text);
-    setContract((current) => ({ ...current, ...nextContract }));
-    setSources((current) => ({
-      ...current,
-      ...(parsed.market ? { market: "user" as ContractSource } : {}),
-      ...(parsed.universe ? { universe: "user" as ContractSource } : {}),
-      ...(parsed.rebalance ? { rebalanceFrequency: "user" as ContractSource } : {}),
-      ...(parsed.execution ? { executionTiming: "user" as ContractSource } : {}),
-      ...(parsed.factors.length ? { factorsOrSignals: "user" as ContractSource } : {}),
-    }));
-    const recognized = [
-      parsed.market,
-      parsed.universe,
-      parsed.rebalance,
-      parsed.execution,
-      parsed.factors.length ? parsed.factors.join("、") : undefined,
-    ].filter(Boolean);
-    if (recognized.length === 0) {
-      addMessage({ role: "agent", text: "我还无法从这句话确定具体规则。我建议先按“估值 + 质量 + 动量”的默认策略继续。", tone: "warning" });
-      setToast("未识别到明确规则，已保留当前策略并继续");
-    } else {
-      addMessage({ role: "agent", text: `我识别到：${recognized.join("、")}。已有明确内容会写入策略合同，未明确的部分继续采用默认值。`, tone: "success" });
-      setToast("策略合同已根据你的描述更新");
-    }
     setInput("");
+    setAgentBusy(true);
+    setStage("parsing");
+    try {
+      const response = await fetch("/api/agent", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ input: text, contract }),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const update = await response.json() as AgentTurnResult;
+      setContract(update.contract);
+      syncContractStage(update.contract);
+      if (update.recognized.length === 0) {
+        addMessage({ role: "agent", text: `${update.summary}${update.nextQuestion ? ` 建议先继续确认${update.nextQuestion.label}。` : " 当前合同没有待确认项。"}`, tone: "warning" });
+        setToast("未识别到明确规则，已保留当前策略并继续");
+      } else {
+        const templateNote = update.templateChanged ? ` 已切换为“${update.contract.templateLabel}”模板。` : "";
+        const conflictNote = update.contract.conflicts.some((item) => item.severity === "blocking") ? " 检测到阻塞冲突，需要先解决。" : "";
+        addMessage({ role: "agent", text: `${update.summary}${templateNote}${conflictNote} ${nextStepText(update.contract)}`, tone: conflictNote ? "warning" : "success" });
+        setToast(`${update.provider === "deepseek" ? "在线模型" : "本地回退"}已更新合同 ${update.changedFields.length} 项`);
+      }
+    } catch {
+      setStage("clarifying");
+      addMessage({ role: "agent", text: "这次解析请求没有完成，合同未发生变化。你可以直接重试。", tone: "warning" });
+      setToast("解析失败，策略合同未修改");
+    } finally {
+      setAgentBusy(false);
+    }
   }
 
   function confirmAndBacktest() {
+    if (!isContractReady(contract)) {
+      setStage("clarifying");
+      setToast("还有待确认字段或阻塞冲突，暂时不能回测");
+      return;
+    }
     setView("research");
     setStage("backtest_running");
     setBacktestStep(0);
     setResult(null);
+    setAuditReport(null);
     addMessage({ role: "system", text: "已确认策略合同，开始执行模拟回测流程。" });
   }
 
   function skipBacktest() {
     if (!isBacktest) return;
     setBacktestStep(backtestSteps.length - 1);
-    setResult(mockBacktestResult);
+    const report = auditContract(contract);
+    setAuditReport(report);
+    setResult(report.status === "failed" ? null : currentResult);
+    if (report.status === "failed") {
+      setStage("clarifying");
+      setInspectorTab("audit");
+      setToast("审计发现阻塞错误，请先修改策略合同");
+      return;
+    }
     setStage("report_ready");
     setInspectorTab("audit");
     setView("report");
@@ -303,24 +251,13 @@ export default function Home() {
   function newResearch() {
     setView("research");
     setStage("clarifying");
-    setContract(initialContract);
-    setSources(initialSources);
-    setAssumptions(defaultAssumptions);
+    setContract(createStrategyContract("multi_factor"));
     setMessages([{ id: "agent-new", role: "agent", text: "告诉我你想研究什么样的 A 股策略。我会逐步把它澄清成可回测规则。" }]);
-    setActiveQuestion("universe");
     setResult(null);
+    setAuditReport(null);
     setInspectorTab("contract");
     setToast("已新建策略研究");
   }
-
-  const auditItems = [
-    ["未来函数检查", "未发现", "pass"],
-    ["T 日信号 / T+1 执行", "已启用", "pass"],
-    ["手续费与滑点", "已计入", "pass"],
-    ["涨跌停模拟", "已模拟", "pass"],
-    ["停牌约束", "已模拟", "pass"],
-    ["样本外测试", "未完成", "warning"],
-  ] as const;
 
   const activeExperimentData = useMemo(() => experiments.find((item) => item.id === activeExperiment) ?? experiments[1], [activeExperiment]);
   const currentResult = result ?? activeExperimentData.result;
@@ -374,14 +311,12 @@ export default function Home() {
               messages={messages}
               stage={stage}
               activeConfig={activeConfig}
-              activeQuestion={activeQuestion}
-              progress={progress}
-              completedFields={completedFields}
-              totalFields={totalFields}
+              contractProgress={contractProgress}
               explanationOpen={explanationOpen}
               customOpen={customOpen}
               customInput={customInput}
               input={input}
+              agentBusy={agentBusy}
               onInputChange={setInput}
               onSubmit={handleInputSubmit}
               onAccept={acceptDefault}
@@ -391,6 +326,7 @@ export default function Home() {
               onCustomInputChange={setCustomInput}
               onApplyCustomText={applyCustomText}
               onConfirm={confirmAndBacktest}
+              onReturnToEdit={() => { setStage("clarifying"); setToast("请在下方输入要修改的规则"); }}
               onSkip={skipBacktest}
               backtestStep={backtestStep}
             />
@@ -406,9 +342,9 @@ export default function Home() {
             <button className={inspectorTab === "audit" ? "selected" : ""} type="button" onClick={() => setInspectorTab("audit")}>审计</button>
           </div>
           {inspectorTab === "contract" ? (
-            <ContractPanel contract={contract} sources={sources} assumptions={assumptions} onEdit={() => setToast("编辑策略合同：请使用中央对话中的“修改”入口")}/>
+            <ContractPanel contract={contract} onEdit={() => { setView("research"); setStage("clarifying"); setToast("请在中央对话中描述要修改的规则"); }}/>
           ) : (
-            <AuditPanel result={result} items={auditItems} />
+            <AuditPanel result={result} report={auditReport} />
           )}
         </aside>
       </div>
@@ -422,14 +358,12 @@ function ResearchView({
   messages,
   stage,
   activeConfig,
-  activeQuestion,
-  progress,
-  completedFields,
-  totalFields,
+  contractProgress,
   explanationOpen,
   customOpen,
   customInput,
   input,
+  agentBusy,
   onInputChange,
   onSubmit,
   onAccept,
@@ -439,20 +373,19 @@ function ResearchView({
   onCustomInputChange,
   onApplyCustomText,
   onConfirm,
+  onReturnToEdit,
   onSkip,
   backtestStep,
 }: {
   messages: Message[];
   stage: AgentStage;
-  activeConfig: QuestionConfig | null;
-  activeQuestion: QuestionKey | null;
-  progress: number;
-  completedFields: number;
-  totalFields: number;
+  activeConfig: ClarificationQuestion | null;
+  contractProgress: ContractProgress;
   explanationOpen: boolean;
   customOpen: boolean;
   customInput: string;
   input: string;
+  agentBusy: boolean;
   onInputChange: (value: string) => void;
   onSubmit: () => void;
   onAccept: () => void;
@@ -462,6 +395,7 @@ function ResearchView({
   onCustomInputChange: (value: string) => void;
   onApplyCustomText: () => void;
   onConfirm: () => void;
+  onReturnToEdit: () => void;
   onSkip: () => void;
   backtestStep: number;
 }) {
@@ -481,7 +415,7 @@ function ResearchView({
           </div>
         ))}
 
-        {activeConfig && !isRunning && !isReady && (
+        {activeConfig && !isRunning && !isReady && !agentBusy && (
           <div className="recommendation-card">
             <p>{activeConfig.description}我先按这个设置继续。</p>
             <div className="recommendation-actions">
@@ -515,8 +449,8 @@ function ResearchView({
             <div>
               <h2>策略合同已完成</h2>
               <p>所有核心字段都具备可执行定义。请检查右侧默认假设后决定是否开始模拟回测。</p>
-              <div className="confirmation-counts"><span>用户明确要求：6 项</span><span>系统默认值：4 项</span><span>待确认问题：0 项</span></div>
-              <div className="recommendation-actions"><button className="secondary-button" type="button" onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}>返回修改</button><button className="primary-button" type="button" onClick={onConfirm}>确认策略并开始回测</button></div>
+              <div className="confirmation-counts"><span>用户明确：{contractProgress.sourceCounts.user} 项</span><span>系统默认：{contractProgress.sourceCounts.agent_default} 项</span><span>用户修改：{contractProgress.sourceCounts.user_override} 项</span></div>
+              <div className="recommendation-actions"><button className="secondary-button" type="button" onClick={onReturnToEdit}>返回修改</button><button className="primary-button" type="button" onClick={onConfirm}>确认策略并开始回测</button></div>
             </div>
           </div>
         )}
@@ -524,17 +458,19 @@ function ResearchView({
         {stage === "report_ready" && <div className="report-ready-note"><span>✓</span><span>回测与审计完成。你可以从左侧打开回测报告，或继续创建下一组实验。</span></div>}
 
         <div className="progress-block">
-          <div className="progress-header"><span>策略澄清进度</span><span>{completedFields} / {totalFields} 项 · {progress}%</span></div>
-          <div className="progress-bar"><span style={{ width: `${progress}%` }} /></div>
+          <div className="progress-header"><span>可回测准备度</span><span>{contractProgress.resolved} / {contractProgress.total} 项 · {contractProgress.percent}%</span></div>
+          <div className="progress-bar"><span style={{ width: `${contractProgress.percent}%` }} /></div>
           <div className="progress-items">
-            <span className="complete">✓ 市场</span><span className="complete">✓ 策略方向</span><span className={activeQuestion === "universe" ? "current" : completedFields > 2 ? "complete" : ""}>{activeQuestion === "universe" ? "○ 股票池" : "✓ 股票池"}</span><span className={activeQuestion ? "" : "current"}>{activeQuestion ? "○ 执行与调仓" : "✓ 执行与调仓"}</span>
+            <span className="complete">✓ 已完成 {contractProgress.resolved} 项</span>
+            <span className={contractProgress.pendingLabels.length ? "current" : "complete"}>{contractProgress.pendingLabels.length ? `○ 待确认：${contractProgress.pendingLabels.slice(0, 4).join("、")}` : "✓ 没有阻塞项"}</span>
+            {contractProgress.blockingConflicts.length > 0 && <span className="current">! 冲突：{contractProgress.blockingConflicts.map((item) => item.message).join("；")}</span>}
           </div>
         </div>
       </div>
 
       <form className="composer" onSubmit={(event) => { event.preventDefault(); onSubmit(); }}>
-        <textarea value={input} onChange={(event) => onInputChange(event.target.value)} placeholder="告诉助手你的想法，或者修改当前策略合同……" rows={1} />
-        <div className="composer-row"><span className="composer-tools"><button type="button">＋</button><button type="button">⌁</button><button type="button">◉</button></span><span className="composer-mode">策略澄清⌄</span><button className="send-button" type="submit">↑</button></div>
+        <textarea disabled={agentBusy} value={input} onChange={(event) => onInputChange(event.target.value)} placeholder={agentBusy ? "正在分析并校验合同……" : "告诉助手你的想法，或者修改当前策略合同……"} rows={1} />
+        <div className="composer-row"><span className="composer-tools"><button type="button">＋</button><button type="button">⌁</button><button type="button">◉</button></span><span className="composer-mode">{agentBusy ? "正在分析" : "策略澄清⌄"}</span><button className="send-button" disabled={agentBusy} type="submit">↑</button></div>
       </form>
     </section>
   );
@@ -550,20 +486,26 @@ function BacktestProgress({ step, onSkip, stage }: { step: number; onSkip: () =>
   );
 }
 
-function ContractPanel({ contract, sources, assumptions, onEdit }: { contract: StrategyContract; sources: Record<keyof StrategyContract, ContractSource>; assumptions: Assumption[]; onEdit: () => void }) {
+function ContractPanel({ contract, onEdit }: { contract: StrategyContract; onEdit: () => void }) {
+  const fields = getContractFields(contract);
+  const assumptions = fields.filter((field) => field.source === "agent_default");
+  const changes = contract.changes.slice(-5).reverse();
   return (
-    <div className="inspector-content"><div className="panel-eyebrow">当前策略</div><div className="contract-heading"><span>策略合同</span><button type="button" onClick={onEdit}>编辑</button></div>
-      <div className="contract-rows">{contractRows.map((row) => <div className="contract-row" key={row.key}><div><span>{row.label}</span><small>{sourceLabel[sources[row.key]]}</small></div><strong className={sources[row.key] === "pending" ? "pending" : sources[row.key] === "agent_default" ? "default" : ""}>{fieldDisplayValue(contract[row.key])}</strong></div>)}</div>
-      <div className="inspector-section"><div className="panel-eyebrow">默认假设</div>{assumptions.filter((item) => item.status === "active").slice(-4).map((item) => <div className="assumption-row" key={`${item.field}-${item.value}`}><span className="assumption-dot">●</span><span>{item.field}<small>{item.value}</small></span><em>{sourceLabel[item.source]}</em></div>)}</div>
+    <div className="inspector-content"><div className="panel-eyebrow">{contract.templateLabel} · 版本 {contract.version}</div><div className="contract-heading"><span>策略合同</span><button type="button" onClick={onEdit}>编辑</button></div>
+      <div className="contract-rows">{fields.map((field) => <div className="contract-row" key={field.key}><div><span>{field.label}</span><small>{contractSourceLabels[field.source]}</small></div><strong className={field.source === "pending" ? "pending" : field.source === "agent_default" ? "default" : ""}>{field.value ?? "待确认"}</strong></div>)}</div>
+      <div className="inspector-section"><div className="panel-eyebrow">默认假设</div>{assumptions.slice(-4).map((field) => <div className="assumption-row" key={`${field.key}-${field.value}`}><span className="assumption-dot">●</span><span>{field.label}<small>{field.value}</small></span><em>{contractSourceLabels[field.source]}</em></div>)}</div>
+      <div className="inspector-section"><div className="panel-eyebrow">合同变更</div>{changes.length ? changes.map((change) => <div className="change-row" key={change.id}><span>v{change.version}</span><span>{change.fieldLabel}<small>{change.fromValue ?? "待确认"} → {change.toValue}</small></span><em>{contractSourceLabels[change.source]}</em></div>) : <div className="empty-history">暂无变更</div>}</div>
+      {contract.conflicts.length > 0 && <div className="inspector-section"><div className="panel-eyebrow">规则冲突</div>{contract.conflicts.map((conflict) => <div className={`audit-row ${conflict.severity === "blocking" ? "fail" : "warning"}`} key={conflict.id}><span className="audit-icon">!</span><span>{conflict.message}</span><em>{conflict.severity === "blocking" ? "阻塞" : "警告"}</em></div>)}</div>}
       <div className="inspector-notice"><strong>助手的工作原则</strong><span>可以推荐默认值继续，但所有默认假设都会记录，并在回测前集中确认。</span></div>
     </div>
   );
 }
 
-function AuditPanel({ result, items }: { result: BacktestResult | null; items: readonly (readonly [string, string, string])[] }) {
+function AuditPanel({ result, report }: { result: BacktestResult | null; report: BacktestAuditReport | null }) {
+  const items = report?.checks ?? [];
   return (
     <div className="inspector-content"><div className="panel-eyebrow">审计检查</div><div className="contract-heading"><span>回测审计</span><button type="button">查看规则</button></div>
-      {items.map(([label, value, tone]) => <div className={`audit-row ${tone}`} key={label}><span className="audit-icon">{tone === "warning" ? "!" : "✓"}</span><span>{label}</span><em>{value}</em></div>)}
+      {items.length ? items.map((item) => <div className={`audit-row ${item.status === "passed" ? "pass" : item.status === "failed" ? "fail" : "warning"}`} key={item.id} title={`${item.message}；依据：${item.evidence}`}><span className="audit-icon">{item.status === "passed" ? "✓" : "!"}</span><span>{item.label}</span><em>{item.status === "passed" ? "通过" : item.status === "failed" ? "失败" : item.status === "not_run" ? "未执行" : "警告"}</em></div>) : <div className="empty-history">完成一次回测后生成结构化审计结果</div>}
       <div className="inspector-section"><div className="panel-eyebrow">净值预览</div><div className="mini-chart"><svg viewBox="0 0 280 90" preserveAspectRatio="none" role="img" aria-label="模拟净值曲线"><defs><linearGradient id="equity-area" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stopColor="#79c99a" stopOpacity=".35"/><stop offset="1" stopColor="#79c99a" stopOpacity="0"/></linearGradient></defs><path className="chart-area" fill="url(#equity-area)" d="M0 82 L20 73 L40 76 L60 57 L80 61 L100 47 L120 51 L140 34 L160 42 L180 25 L200 33 L220 20 L240 25 L260 11 L280 18 L280 90 L0 90 Z"/><path className="chart-line" d="M0 82 L20 73 L40 76 L60 57 L80 61 L100 47 L120 51 L140 34 L160 42 L180 25 L200 33 L220 20 L240 25 L260 11 L280 18"/></svg></div><div className="chart-caption"><span>{result ? "模拟报告已完成" : "开始回测后显示"}</span><span>{result?.cumulativeReturn ?? "—"}</span></div></div>
       <div className="inspector-notice"><strong>研究边界</strong><span>模拟结果仅用于体验流程，不代表真实历史收益或投资建议。</span></div>
     </div>
