@@ -14,7 +14,8 @@ import { auditContract, runBacktestTool, type BacktestAuditReport } from "@/lib/
 import type { AgentTurnResult } from "@/lib/agent";
 import {
   contractSourceLabels,
-  createStrategyContract,
+  createEmptyStrategyContract,
+  detectContractConflicts,
   getContractFields,
   getContractProgress,
   getNextQuestion,
@@ -57,25 +58,67 @@ const navItems: Array<{ id: View; label: string; icon: string }> = [
   { id: "report", label: "回测报告", icon: "▥" },
 ];
 
+type ProjectSession = {
+  id: string;
+  title: string;
+  stage: AgentStage;
+  contract: StrategyContract;
+  messages: Message[];
+  result: BacktestResult | null;
+  auditReport: BacktestAuditReport | null;
+  hasUserIntent: boolean;
+};
+
+const initialProject: ProjectSession = {
+  id: "a-share-low-vol",
+  title: "A股低波动多因子",
+  stage: "clarifying",
+  contract: initialContract,
+  messages: defaultMessages,
+  result: null,
+  auditReport: null,
+  hasUserIntent: true,
+};
+
 export default function Home() {
   const [view, setView] = useState<View>("research");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>("contract");
-  const [stage, setStage] = useState<AgentStage>("clarifying");
-  const [contract, setContract] = useState<StrategyContract>(initialContract);
-  const [messages, setMessages] = useState<Message[]>(defaultMessages);
+  const [projects, setProjects] = useState<ProjectSession[]>([initialProject]);
+  const [activeProjectId, setActiveProjectId] = useState(initialProject.id);
   const [explanationOpen, setExplanationOpen] = useState(false);
   const [customOpen, setCustomOpen] = useState(false);
   const [customInput, setCustomInput] = useState("");
   const [toast, setToast] = useState<string | null>(null);
   const [input, setInput] = useState("");
   const [backtestStep, setBacktestStep] = useState(0);
-  const [result, setResult] = useState<BacktestResult | null>(null);
-  const [auditReport, setAuditReport] = useState<BacktestAuditReport | null>(null);
   const [agentBusy, setAgentBusy] = useState(false);
   const [activeExperiment, setActiveExperiment] = useState("exp-002");
 
-  const activeConfig = getNextQuestion(contract);
+  const activeProject = projects.find((project) => project.id === activeProjectId) ?? projects[0];
+  const { stage, contract, messages, result, auditReport } = activeProject;
+
+  function updateActiveProject(update: Partial<Omit<ProjectSession, "id">>) {
+    setProjects((current) => current.map((project) => project.id === activeProjectId ? { ...project, ...update } : project));
+  }
+
+  function setActiveStage(nextStage: AgentStage) {
+    updateActiveProject({ stage: nextStage });
+  }
+
+  function setActiveContract(nextContract: StrategyContract) {
+    updateActiveProject({ contract: nextContract });
+  }
+
+  function setActiveResult(nextResult: BacktestResult | null) {
+    updateActiveProject({ result: nextResult });
+  }
+
+  function setActiveAuditReport(nextReport: BacktestAuditReport | null) {
+    updateActiveProject({ auditReport: nextReport });
+  }
+
+  const activeConfig = activeProject.hasUserIntent ? getNextQuestion(contract) : null;
   const contractProgress = getContractProgress(contract);
   const isBacktest = stage === "backtest_running" || stage === "audit_running";
 
@@ -92,7 +135,7 @@ export default function Home() {
       return () => window.clearTimeout(timer);
     }
     const timer = window.setTimeout(() => {
-      setStage("audit_running");
+      setActiveStage("audit_running");
       setBacktestStep(0);
     }, 650);
     return () => window.clearTimeout(timer);
@@ -103,16 +146,16 @@ export default function Home() {
     let cancelled = false;
     void runBacktestTool(contract).then((run) => {
       if (cancelled) return;
-      setResult(run.result);
-      setAuditReport(run.audit);
+      setActiveResult(run.result);
+      setActiveAuditReport(run.audit);
       setInspectorTab("audit");
       if (run.status === "rejected" || !run.result) {
-        setStage("clarifying");
+        setActiveStage("clarifying");
         setView("research");
         setToast("审计发现阻塞错误，请先修改策略合同");
         return;
       }
-      setStage("report_ready");
+      setActiveStage("report_ready");
       setView("report");
       setToast("回测与审计完成，报告已生成");
     });
@@ -120,11 +163,13 @@ export default function Home() {
   }, [stage, contract]);
 
   function addMessage(message: Omit<Message, "id">) {
-    setMessages((current) => [...current, { ...message, id: `${message.role}-${Date.now()}-${current.length}` }]);
+    setProjects((current) => current.map((project) => project.id === activeProjectId
+      ? { ...project, messages: [...project.messages, { ...message, id: `${message.role}-${Date.now()}-${project.messages.length}` }] }
+      : project));
   }
 
   function syncContractStage(next: StrategyContract) {
-    setStage(isContractReady(next) ? "awaiting_confirmation" : "clarifying");
+    setActiveStage(isContractReady(next) ? "awaiting_confirmation" : "clarifying");
   }
 
   function nextStepText(next: StrategyContract): string {
@@ -137,23 +182,31 @@ export default function Home() {
   function acceptDefault() {
     if (!activeConfig) return;
     const next = updateContractField(contract, activeConfig.key, activeConfig.value, "agent_default", activeConfig.reason);
-    setContract(next);
+    setActiveContract(next);
     syncContractStage(next);
     setExplanationOpen(false);
     setCustomOpen(false);
     setToast(`已采用默认值：${activeConfig.value}`);
-    addMessage({ role: "agent", text: `已将${activeConfig.label}记录为“${activeConfig.value}”。${nextStepText(next)}`, tone: "success" });
+    addMessage({
+      role: "agent",
+      text: `我会按这个设置继续。${nextStepText(next)}`,
+      status: `合同已更新：${activeConfig.label} = ${activeConfig.value}`,
+    });
   }
 
   function applyCustom(value: string) {
     if (!activeConfig) return;
     const next = updateContractField(contract, activeConfig.key, value, "user_override", `用户将${activeConfig.label}修改为“${value}”。`);
-    setContract(next);
+    setActiveContract(next);
     syncContractStage(next);
     setCustomOpen(false);
     setExplanationOpen(false);
     setToast(`已更新${activeConfig.label}：${value}`);
-    addMessage({ role: "agent", text: `已采用你的${activeConfig.label}设置“${value}”。${nextStepText(next)}`, tone: "success" });
+    addMessage({
+      role: "agent",
+      text: `我会按你的设置继续。${nextStepText(next)}`,
+      status: `合同已更新：${activeConfig.label} = ${value}`,
+    });
   }
 
   function applyCustomText() {
@@ -165,9 +218,13 @@ export default function Home() {
     }
     addMessage({ role: "user", text: `我建议${activeConfig.label}：${value}` });
     const next = updateContractField(contract, activeConfig.key, value, "user_override", `用户自定义${activeConfig.label}：“${value}”。`);
-    setContract(next);
+    setActiveContract(next);
     syncContractStage(next);
-    addMessage({ role: "agent", text: `我会将${activeConfig.label}记录为“${value}”。${nextStepText(next)}`, tone: "success" });
+    addMessage({
+      role: "agent",
+      text: `我会按你的方案继续。${nextStepText(next)}`,
+      status: `合同已更新：${activeConfig.label} = ${value}`,
+    });
     setCustomInput("");
     setCustomOpen(false);
     setExplanationOpen(false);
@@ -187,7 +244,8 @@ export default function Home() {
     addMessage({ role: "user", text });
     setInput("");
     setAgentBusy(true);
-    setStage("parsing");
+    updateActiveProject({ hasUserIntent: true });
+    setActiveStage("parsing");
     try {
       const response = await fetch("/api/agent", {
         method: "POST",
@@ -196,7 +254,7 @@ export default function Home() {
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const update = await response.json() as AgentTurnResult;
-      setContract(update.contract);
+      setActiveContract(update.contract);
       syncContractStage(update.contract);
       if (update.recognized.length === 0) {
         addMessage({ role: "agent", text: `${update.summary}${update.nextQuestion ? ` 建议先继续确认${update.nextQuestion.label}。` : " 当前合同没有待确认项。"}`, tone: "warning" });
@@ -204,11 +262,16 @@ export default function Home() {
       } else {
         const templateNote = update.templateChanged ? ` 已切换为“${update.contract.templateLabel}”模板。` : "";
         const conflictNote = update.contract.conflicts.some((item) => item.severity === "blocking") ? " 检测到阻塞冲突，需要先解决。" : "";
-        addMessage({ role: "agent", text: `${update.summary}${templateNote}${conflictNote} ${nextStepText(update.contract)}`, tone: conflictNote ? "warning" : "success" });
+        addMessage({
+          role: "agent",
+          text: `${update.summary}${templateNote}${conflictNote} ${nextStepText(update.contract)}`,
+          tone: conflictNote ? "warning" : "normal",
+          status: conflictNote ? undefined : `合同已更新 ${update.changedFields.length} 项`,
+        });
         setToast(`${update.provider === "deepseek" ? "在线模型" : "本地回退"}已更新合同 ${update.changedFields.length} 项`);
       }
     } catch {
-      setStage("clarifying");
+      setActiveStage("clarifying");
       addMessage({ role: "agent", text: "这次解析请求没有完成，合同未发生变化。你可以直接重试。", tone: "warning" });
       setToast("解析失败，策略合同未修改");
     } finally {
@@ -218,15 +281,15 @@ export default function Home() {
 
   function confirmAndBacktest() {
     if (!isContractReady(contract)) {
-      setStage("clarifying");
+      setActiveStage("clarifying");
       setToast("还有待确认字段或阻塞冲突，暂时不能回测");
       return;
     }
     setView("research");
-    setStage("backtest_running");
+    setActiveStage("backtest_running");
     setBacktestStep(0);
-    setResult(null);
-    setAuditReport(null);
+    setActiveResult(null);
+    setActiveAuditReport(null);
     addMessage({ role: "system", text: "已确认策略合同，开始执行模拟回测流程。" });
   }
 
@@ -234,29 +297,64 @@ export default function Home() {
     if (!isBacktest) return;
     setBacktestStep(backtestSteps.length - 1);
     const report = auditContract(contract);
-    setAuditReport(report);
-    setResult(report.status === "failed" ? null : currentResult);
+    setActiveAuditReport(report);
+    setActiveResult(report.status === "failed" ? null : currentResult);
     if (report.status === "failed") {
-      setStage("clarifying");
+      setActiveStage("clarifying");
       setInspectorTab("audit");
       setToast("审计发现阻塞错误，请先修改策略合同");
       return;
     }
-    setStage("report_ready");
+    setActiveStage("report_ready");
     setInspectorTab("audit");
     setView("report");
     setToast("已跳过等待，模拟回测报告已生成");
   }
 
   function newResearch() {
+    const newProjectCount = projects.filter((project) => project.id.startsWith("new-research-")).length + 1;
+    const newProject: ProjectSession = {
+      id: `new-research-${Date.now()}`,
+      title: `未命名策略研究 ${newProjectCount}`,
+      stage: "clarifying",
+      contract: createEmptyStrategyContract(),
+      messages: [{ id: `agent-new-${Date.now()}`, role: "agent", text: "告诉我你想研究什么样的策略。我会逐步把它澄清成可回测规则。" }],
+      result: null,
+      auditReport: null,
+      hasUserIntent: false,
+    };
+    setProjects((current) => [...current, newProject]);
+    setActiveProjectId(newProject.id);
     setView("research");
-    setStage("clarifying");
-    setContract(createStrategyContract("multi_factor"));
-    setMessages([{ id: "agent-new", role: "agent", text: "告诉我你想研究什么样的 A 股策略。我会逐步把它澄清成可回测规则。" }]);
-    setResult(null);
-    setAuditReport(null);
+    setExplanationOpen(false);
+    setCustomOpen(false);
+    setCustomInput("");
+    setInput("");
     setInspectorTab("contract");
-    setToast("已新建策略研究");
+    setToast(`已新建${newProject.title}`);
+  }
+
+  function selectProject(projectId: string) {
+    setActiveProjectId(projectId);
+    setView("research");
+    setInspectorTab("contract");
+    setExplanationOpen(false);
+    setCustomOpen(false);
+  }
+
+  function closeProject(projectId: string) {
+    if (projects.length === 1) {
+      setToast("请至少保留一个策略项目");
+      return;
+    }
+    const projectIndex = projects.findIndex((project) => project.id === projectId);
+    const remainingProjects = projects.filter((project) => project.id !== projectId);
+    setProjects(remainingProjects);
+    if (projectId === activeProjectId) {
+      const nextProject = remainingProjects[Math.max(0, projectIndex - 1)];
+      selectProject(nextProject.id);
+    }
+    setToast("策略项目已关闭");
   }
 
   const activeExperimentData = useMemo(() => experiments.find((item) => item.id === activeExperiment) ?? experiments[1], [activeExperiment]);
@@ -286,10 +384,13 @@ export default function Home() {
           ))}
 
           <div className="nav-label">策略项目</div>
-          <button className="project-item selected" type="button" onClick={() => setView("research")}>
-            <span className="project-title"><span className="project-dot" /><span>A股低波动多因子</span></span>
-            <span className="project-meta">{stageLabel[stage]} · 刚刚</span>
-          </button>
+          {projects.map((project) => <div className={`project-item ${project.id === activeProjectId ? "selected" : ""}`} key={project.id}>
+            <button className="project-select" type="button" onClick={() => selectProject(project.id)}>
+              <span className="project-title"><span className={`project-dot ${project.stage === "report_ready" ? "" : "gray"}`} /><span>{project.title}</span></span>
+              <span className="project-meta">{stageLabel[project.stage]} · 刚刚</span>
+            </button>
+            <button className="project-close" type="button" aria-label={`关闭${project.title}`} title="关闭项目" onClick={() => closeProject(project.id)}>×</button>
+          </div>)}
           <button className="project-item muted-project" type="button" onClick={() => setToast("历史项目是模拟占位") }>
             <span className="project-title"><span className="project-dot gray" /><span>行业轮动实验</span></span>
             <span className="project-meta">上次回测 · 8 月 12 日</span>
@@ -301,7 +402,7 @@ export default function Home() {
           <div className="main-head">
             <div className="main-head-left">
               {sidebarCollapsed && <button className="sidebar-toggle sidebar-toggle-in-main" type="button" aria-label="展开侧边栏" title="展开侧边栏" onClick={() => setSidebarCollapsed(false)}><span className="sidebar-icon" /></button>}
-              <div className="breadcrumb"><span>策略项目</span><span>›</span><strong>{view === "experiments" ? "实验历史" : view === "report" ? "回测报告" : view === "data" ? "数据源" : "A股低波动多因子"}</strong></div>
+              <div className="breadcrumb"><span>策略项目</span><span>›</span><strong>{view === "experiments" ? "实验历史" : view === "report" ? "回测报告" : view === "data" ? "数据源" : activeProject.title}</strong></div>
             </div>
             <div className="run-status"><span className={`status-dot ${isBacktest ? "running" : stage === "report_ready" ? "done" : ""}`} /><span>{stageLabel[stage]}</span></div>
           </div>
@@ -326,12 +427,12 @@ export default function Home() {
               onCustomInputChange={setCustomInput}
               onApplyCustomText={applyCustomText}
               onConfirm={confirmAndBacktest}
-              onReturnToEdit={() => { setStage("clarifying"); setToast("请在下方输入要修改的规则"); }}
+              onReturnToEdit={() => { setActiveStage("clarifying"); setToast("请在下方输入要修改的规则"); }}
               onSkip={skipBacktest}
               backtestStep={backtestStep}
             />
           )}
-          {view === "report" && <ReportView result={currentResult} onBack={() => setView("research")} />}
+          {view === "report" && <ReportView title={activeProject.title} result={currentResult} onBack={() => setView("research")} />}
           {view === "experiments" && <ExperimentsView activeId={activeExperiment} onSelect={setActiveExperiment} />}
           {view === "data" && <DataView />}
         </main>
@@ -342,7 +443,7 @@ export default function Home() {
             <button className={inspectorTab === "audit" ? "selected" : ""} type="button" onClick={() => setInspectorTab("audit")}>审计</button>
           </div>
           {inspectorTab === "contract" ? (
-            <ContractPanel contract={contract} onEdit={() => { setView("research"); setStage("clarifying"); setToast("请在中央对话中描述要修改的规则"); }}/>
+            <ContractPanel contract={contract} onEdit={() => { setView("research"); setActiveStage("clarifying"); setToast("请在中央对话中描述要修改的规则"); }}/>
           ) : (
             <AuditPanel result={result} report={auditReport} />
           )}
@@ -411,6 +512,7 @@ function ResearchView({
             <div className="message-content">
               <div className="message-author">{message.role === "user" ? "你" : message.role === "system" ? "研究流程" : "量化助手"}</div>
               <div className={`message-text ${message.tone ?? ""}`}>{message.text}</div>
+              {message.status && <div className="message-status" role="status"><span>✓</span><span>{message.status}</span></div>}
             </div>
           </div>
         ))}
@@ -462,7 +564,7 @@ function ResearchView({
           <div className="progress-bar"><span style={{ width: `${contractProgress.percent}%` }} /></div>
           <div className="progress-items">
             <span className="complete">✓ 已完成 {contractProgress.resolved} 项</span>
-            <span className={contractProgress.pendingLabels.length ? "current" : "complete"}>{contractProgress.pendingLabels.length ? `○ 待确认：${contractProgress.pendingLabels.slice(0, 4).join("、")}` : "✓ 没有阻塞项"}</span>
+            <span className={contractProgress.pendingLabels.length ? "current" : "complete"}>{contractProgress.pendingLabels.length ? `○ 待确认：${contractProgress.pendingLabels.join("、")}` : "✓ 没有阻塞项"}</span>
             {contractProgress.blockingConflicts.length > 0 && <span className="current">! 冲突：{contractProgress.blockingConflicts.map((item) => item.message).join("；")}</span>}
           </div>
         </div>
@@ -488,6 +590,7 @@ function BacktestProgress({ step, onSkip, stage }: { step: number; onSkip: () =>
 
 function ContractPanel({ contract, onEdit }: { contract: StrategyContract; onEdit: () => void }) {
   const fields = getContractFields(contract);
+  const conflicts = detectContractConflicts(contract);
   const assumptions = fields.filter((field) => field.source === "agent_default");
   const changes = contract.changes.slice(-5).reverse();
   return (
@@ -495,7 +598,7 @@ function ContractPanel({ contract, onEdit }: { contract: StrategyContract; onEdi
       <div className="contract-rows">{fields.map((field) => <div className="contract-row" key={field.key}><div><span>{field.label}</span><small>{contractSourceLabels[field.source]}</small></div><strong className={field.source === "pending" ? "pending" : field.source === "agent_default" ? "default" : ""}>{field.value ?? "待确认"}</strong></div>)}</div>
       <div className="inspector-section"><div className="panel-eyebrow">默认假设</div>{assumptions.slice(-4).map((field) => <div className="assumption-row" key={`${field.key}-${field.value}`}><span className="assumption-dot">●</span><span>{field.label}<small>{field.value}</small></span><em>{contractSourceLabels[field.source]}</em></div>)}</div>
       <div className="inspector-section"><div className="panel-eyebrow">合同变更</div>{changes.length ? changes.map((change) => <div className="change-row" key={change.id}><span>v{change.version}</span><span>{change.fieldLabel}<small>{change.fromValue ?? "待确认"} → {change.toValue}</small></span><em>{contractSourceLabels[change.source]}</em></div>) : <div className="empty-history">暂无变更</div>}</div>
-      {contract.conflicts.length > 0 && <div className="inspector-section"><div className="panel-eyebrow">规则冲突</div>{contract.conflicts.map((conflict) => <div className={`audit-row ${conflict.severity === "blocking" ? "fail" : "warning"}`} key={conflict.id}><span className="audit-icon">!</span><span>{conflict.message}</span><em>{conflict.severity === "blocking" ? "阻塞" : "警告"}</em></div>)}</div>}
+      {conflicts.length > 0 && <div className="inspector-section"><div className="panel-eyebrow">规则冲突</div>{conflicts.map((conflict) => <div className={`audit-row ${conflict.severity === "blocking" ? "fail" : "warning"}`} key={conflict.id}><span className="audit-icon">!</span><span>{conflict.message}</span><em>{conflict.severity === "blocking" ? "阻塞" : "警告"}</em></div>)}</div>}
       <div className="inspector-notice"><strong>助手的工作原则</strong><span>可以推荐默认值继续，但所有默认假设都会记录，并在回测前集中确认。</span></div>
     </div>
   );
@@ -512,9 +615,9 @@ function AuditPanel({ result, report }: { result: BacktestResult | null; report:
   );
 }
 
-function ReportView({ result, onBack }: { result: BacktestResult; onBack: () => void }) {
+function ReportView({ title, result, onBack }: { title: string; result: BacktestResult; onBack: () => void }) {
   return (
-    <section className="report-view"><div className="report-top"><div><h1 className="page-title">A股低波动多因子</h1></div><button className="secondary-button" type="button" onClick={onBack}>返回研究</button></div>
+    <section className="report-view"><div className="report-top"><div><h1 className="page-title">{title}</h1></div><button className="secondary-button" type="button" onClick={onBack}>返回研究</button></div>
       <div className="synthetic-banner">当前为模拟回测结果，仅用于体验产品流程，不代表真实历史收益或投资建议。</div>
       <div className="metric-grid">{metricCards.map((item) => <div className={`metric-card ${item.tone ?? ""}`} key={item.key}><span>{item.label}</span><strong>{String(result[item.key])}</strong></div>)}</div>
       <div className="chart-grid"><div className="report-panel"><div className="report-panel-head"><span>净值曲线</span><small>2020—2025 · 模拟</small></div><div className="large-chart"><svg viewBox="0 0 620 210" preserveAspectRatio="none" role="img" aria-label="模拟净值曲线"><defs><linearGradient id="report-area" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stopColor="#79c99a" stopOpacity=".24"/><stop offset="1" stopColor="#79c99a" stopOpacity="0"/></linearGradient></defs><g className="grid-lines"><path d="M0 42 H620 M0 84 H620 M0 126 H620 M0 168 H620" /></g><path className="chart-area" fill="url(#report-area)" d="M0 181 L38 169 L76 174 L114 146 L152 153 L190 125 L228 133 L266 100 L304 113 L342 72 L380 86 L418 55 L456 68 L494 43 L532 52 L570 19 L620 33 L620 210 L0 210 Z"/><path className="chart-line" d="M0 181 L38 169 L76 174 L114 146 L152 153 L190 125 L228 133 L266 100 L304 113 L342 72 L380 86 L418 55 L456 68 L494 43 L532 52 L570 19 L620 33"/></svg><div className="chart-axis"><span>2020</span><span>2021</span><span>2022</span><span>2023</span><span>2024</span><span>2025</span></div></div></div><div className="report-panel"><div className="report-panel-head"><span>回撤曲线</span><small>风险观察</small></div><div className="drawdown-chart"><svg viewBox="0 0 320 210" preserveAspectRatio="none" role="img" aria-label="模拟回撤曲线"><path className="draw-grid" d="M0 42 H320 M0 84 H320 M0 126 H320 M0 168 H320"/><path className="draw-area" d="M0 37 L20 42 L40 30 L60 58 L80 45 L100 112 L120 89 L140 139 L160 120 L180 84 L200 101 L220 67 L240 157 L260 105 L280 126 L300 91 L320 104 L320 0 L0 0 Z"/></svg><div className="chart-axis"><span>低风险</span><span>—</span><span>-21.5% 最大回撤</span></div></div></div></div>
@@ -527,6 +630,50 @@ function ExperimentsView({ activeId, onSelect }: { activeId: string; onSelect: (
   return <section className="experiments-view"><div className="experiments-head"><div><h1 className="page-title">实验历史</h1></div><span className="experiment-count">3 个实验</span></div><div className="experiment-layout"><div className="experiment-list">{experiments.map((item) => <button type="button" key={item.id} className={`experiment-item ${activeId === item.id ? "selected" : ""}`} onClick={() => onSelect(item.id)}><span className="experiment-id">{item.id.replace("exp-", "实验 ")}</span><strong>{item.name}</strong><small>{item.changes.join(" · ")}</small><em className={item.auditStatus === "警告" ? "warning" : "pass"}>{item.auditStatus}</em></button>)}</div><div className="experiment-detail"><div className="report-panel-head"><span>实验对比</span><small>指标对比</small></div><div className="comparison-table"><div className="comparison-row header"><span>指标</span><span>实验 001</span><span>实验 002</span><span>实验 003</span></div>{[["累计收益", "18.4%", "24.7%", "21.9%"], ["最大回撤", "-16.2%", "-21.5%", "-13.8%"], ["夏普比率", "0.91", "1.08", "1.02"], ["换手率", "4.8", "8.6", "3.1"], ["审计状态", "通过", "警告", "通过"]].map((row) => <div className="comparison-row" key={row[0]}>{row.map((value, index) => <span className={row[0] === "审计状态" ? (value === "警告" ? "risk-text" : "positive-text") : index > 0 && value.startsWith("-") ? "risk-text" : ""} key={`${value}-${index}`}>{value}</span>)}</div>)}</div><div className="experiment-insight"><span>✦</span><p><strong>{experiments.find((item) => item.id === activeId)?.name}</strong> 当前被选中。助手建议优先关注样本外表现和最大回撤，不要只按累计收益排序。</p></div></div></div></section>;
 }
 
+type DemoDataSource = {
+  id: string;
+  name: string;
+  description: string;
+  source: string;
+  period: string;
+};
+
+const availableDemoSources: DemoDataSource[] = [
+  { id: "a-share-daily", name: "模拟 A 股日线数据", description: "用于演示策略合同、回测阶段和审计报告的固定数据源。", source: "本地模拟", period: "2020—2025" },
+  { id: "hs300-daily", name: "模拟沪深 300 成分数据", description: "包含指数成分、日线行情与基础因子字段的演示数据集。", source: "预置模拟", period: "2020—2025" },
+  { id: "industry-daily", name: "模拟申万行业数据", description: "用于行业轮动和行业中性策略的演示数据集。", source: "预置模拟", period: "2020—2025" },
+];
+
 function DataView() {
-  return <section className="data-view"><h1 className="page-title">数据源</h1><div className="data-source-card"><div className="source-icon">◌</div><div><h2>模拟 A 股日线数据</h2><p>用于演示策略合同、回测阶段和审计报告的固定数据源。</p><div className="source-meta"><span>状态：可用</span><span>来源：本地模拟</span><span>时间范围：2020—2025</span></div></div></div><div className="data-notice"><strong>为什么现在不接真实数据？</strong><span>这个第一版的目标是先验证助手澄清策略的交互闭环。真实数据接入会在策略合同、回测审计和数据时间边界稳定后再进行。</span></div></section>;
+  const [sources, setSources] = useState<DemoDataSource[]>([availableDemoSources[0]]);
+  const [isAdding, setIsAdding] = useState(false);
+  const [feedback, setFeedback] = useState<string | null>(null);
+
+  function addSource(source: DemoDataSource) {
+    if (sources.some((item) => item.id === source.id)) return;
+    setSources((current) => [...current, source]);
+    setFeedback(`已添加：${source.name}`);
+    setIsAdding(false);
+  }
+
+  return (
+    <section className="data-view">
+      <div className="data-head"><h1 className="page-title">数据源</h1><button className="primary-button" type="button" onClick={() => setIsAdding((current) => !current)}>{isAdding ? "取消" : "＋ 添加数据源"}</button></div>
+      {isAdding && (
+        <div className="add-source-panel">
+          <div><strong>添加预置数据源</strong><span>当前为演示数据，不会连接或上传真实行情。</span></div>
+          <div className="source-options">
+            {availableDemoSources.map((source) => {
+              const exists = sources.some((item) => item.id === source.id);
+              return <button key={source.id} className="source-option" type="button" disabled={exists} onClick={() => addSource(source)}><span>◌</span><span><strong>{source.name}</strong><small>{exists ? "已添加" : `${source.source} · ${source.period}`}</small></span></button>;
+            })}
+          </div>
+        </div>
+      )}
+      {feedback && <div className="data-feedback" role="status">✓ {feedback}</div>}
+      <div className="data-source-list">
+        {sources.map((source) => <div className="data-source-card" key={source.id}><div className="source-icon">◌</div><div><h2>{source.name}</h2><p>{source.description}</p><div className="source-meta"><span>状态：可用</span><span>来源：{source.source}</span><span>时间范围：{source.period}</span></div></div></div>)}
+      </div>
+    </section>
+  );
 }

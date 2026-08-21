@@ -19,6 +19,8 @@ DEEPSEEK_BASE_URL=https://api.deepseek.com
 DEEPSEEK_MODEL=deepseek-chat
 ```
 
+不配置这些变量也可以直接运行和体验项目；此时 Agent 会自动使用本地确定性规则回退，适合体验界面和基本策略合同流程，但自然语言理解能力会弱于在线模型。
+
 `.env.local` 已被 Git 忽略，密钥不会发送到浏览器。
 
 ## 当前能力

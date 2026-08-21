@@ -37,6 +37,15 @@ test("阻塞冲突会替代缺失字段成为下一澄清问题", () => {
   assert.equal(isContractReady(contract), false);
 });
 
+test("市场和股票池不一致时阻止合同确认并优先要求修正股票池", () => {
+  let contract = createStrategyContract("multi_factor", "market-universe-conflict");
+  contract = updateContractField(contract, "universe", "美股", "user", "用户明确。" );
+  assert.ok(contract.conflicts.some((conflict) => conflict.id === "market-universe-mismatch"));
+  assert.equal(getNextQuestion(contract)?.kind, "conflict");
+  assert.equal(getNextQuestion(contract)?.key, "universe");
+  assert.equal(isContractReady(contract), false);
+});
+
 test("回测工具请求包含合同版本且审计不会虚报未实现能力", async () => {
   let contract = createStrategyContract("multi_factor", "backtest-tool");
   for (const [key, value] of [["factorsOrSignals", "估值、质量"], ["universe", "沪深 300"], ["rebalanceFrequency", "每月"], ["executionTiming", "收盘生成信号，下一交易日开盘执行"], ["positionLimit", "单只标的不超过 10%"]]) {

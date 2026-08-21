@@ -37,6 +37,8 @@ export type Message = {
   role: "user" | "agent" | "system";
   text: string;
   tone?: "normal" | "warning" | "success";
+  /** A compact semantic outcome shown below an otherwise neutral assistant reply. */
+  status?: string;
 };
 
 export const initialContract = createExampleContract();

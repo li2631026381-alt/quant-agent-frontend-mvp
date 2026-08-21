@@ -2,12 +2,23 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   applyNaturalLanguage,
+  createEmptyStrategyContract,
   createStrategyContract,
   detectStrategyType,
   getContractProgress,
   getNextQuestion,
   updateContractField,
 } from "../lib/strategy-domain.ts";
+
+test("新策略会话在用户首次输入前不接受默认值", () => {
+  const contract = createEmptyStrategyContract("blank-session");
+  const progress = getContractProgress(contract);
+
+  assert.equal(contract.templateLabel, "待识别策略类型");
+  assert.equal(progress.resolved, 0);
+  assert.equal(progress.total, 10);
+  assert.equal(progress.percent, 0);
+});
 
 test("识别三种首批策略模板", () => {
   assert.equal(detectStrategyType("做低估值和质量多因子选股"), "multi_factor");
@@ -26,6 +37,15 @@ test("自然语言只增量修改相关字段", () => {
   assert.equal(contract.fields.universe?.source, universeBefore?.source);
   assert.equal(contract.fields.rebalanceFrequency?.value, "每季度");
   assert.equal(contract.fields.rebalanceFrequency?.source, "user");
+});
+
+test("本地回退可识别小写 a股 市场表达", () => {
+  const contract = createEmptyStrategyContract("lowercase-a-share");
+  const turn = applyNaturalLanguage(contract, "我要研究a股市场");
+
+  assert.equal(turn.contract.fields.market?.value, "A 股");
+  assert.equal(turn.contract.fields.market?.source, "user");
+  assert.ok(turn.recognized.includes("市场：A 股"));
 });
 
 test("切换策略类型会加载新模板并保留公共字段", () => {

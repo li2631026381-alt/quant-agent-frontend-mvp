@@ -171,7 +171,7 @@ export function createAgentPrompt(contract: StrategyContract, input: string): st
     currentTemplate: contract.templateId,
     allowedFields,
     currentFields,
-    currentConflicts: contract.conflicts,
+    currentConflicts: detectContractConflicts(contract),
     userInput: input,
     outputFormat: {
       strategyType: "multi_factor | timing | rotation | 省略",

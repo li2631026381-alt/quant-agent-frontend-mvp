@@ -51,7 +51,7 @@ export type ContractChange = {
 
 export type ContractConflict = {
   id: string;
-  type: "lookahead" | "rule_order" | "invalid_value" | "missing_cost";
+  type: "lookahead" | "rule_order" | "invalid_value" | "missing_cost" | "market_universe_mismatch";
   severity: "blocking" | "warning";
   fields: ContractFieldKey[];
   message: string;
@@ -333,6 +333,21 @@ export function createStrategyContract(templateId: StrategyType, id = `contract-
   };
 }
 
+/** A blank research session must not silently accept any defaults before first input. */
+export function createEmptyStrategyContract(id = `contract-${Date.now()}`): StrategyContract {
+  const contract = createStrategyContract("multi_factor", id);
+  return {
+    ...contract,
+    templateLabel: "待识别策略类型",
+    fields: Object.fromEntries(Object.entries(contract.fields).map(([key, field]) => [key, {
+      ...field,
+      value: null,
+      source: "pending" as const,
+      reason: undefined,
+    }])),
+  };
+}
+
 function firstNumber(value?: string | null): number | undefined {
   const match = value?.match(/(\d+(?:\.\d+)?)/);
   return match ? Number(match[1]) : undefined;
@@ -340,7 +355,20 @@ function firstNumber(value?: string | null): number | undefined {
 
 export function detectContractConflicts(contract: StrategyContract): ContractConflict[] {
   const conflicts: ContractConflict[] = [];
+  const market = contract.fields.market?.value;
+  const universe = contract.fields.universe?.value;
   const execution = contract.fields.executionTiming?.value;
+
+  if (market === "A 股" && universe && /美股|美利坚|纳斯达克|纽约证交所|纽交所|标普|道琼斯|NYSE|NASDAQ/i.test(universe)) {
+    conflicts.push({
+      id: "market-universe-mismatch",
+      type: "market_universe_mismatch",
+      severity: "blocking",
+      fields: ["market", "universe"],
+      message: "市场设置为 A 股，但股票池包含美股，两者不能使用同一套回测规则。",
+      suggestion: "若研究 A 股，建议将股票池改为沪深 300、中证 500 或全 A 股；若研究美股，应先切换市场和数据模板。",
+    });
+  }
 
   if (execution?.includes("当日收盘")) {
     conflicts.push({
@@ -486,6 +514,7 @@ export function switchStrategyTemplate(
 
 export function getContractProgress(contract: StrategyContract): ContractProgress {
   const required = getContractFields(contract).filter((field) => field.required);
+  const conflicts = detectContractConflicts(contract);
   const resolvedFields = required.filter((field) => field.value && field.source !== "pending");
   const sourceCounts = { user: 0, agent_default: 0, user_override: 0 };
 
@@ -498,7 +527,7 @@ export function getContractProgress(contract: StrategyContract): ContractProgres
     total: required.length,
     percent: required.length ? Math.round((resolvedFields.length / required.length) * 100) : 100,
     pendingLabels: required.filter((field) => !field.value || field.source === "pending").map((field) => field.label),
-    blockingConflicts: contract.conflicts.filter((conflict) => conflict.severity === "blocking"),
+    blockingConflicts: conflicts.filter((conflict) => conflict.severity === "blocking"),
     sourceCounts,
   };
 }
@@ -509,7 +538,7 @@ export function isContractReady(contract: StrategyContract): boolean {
 }
 
 export function getNextQuestion(contract: StrategyContract): ClarificationQuestion | null {
-  const conflict = contract.conflicts.find((item) => item.severity === "blocking");
+  const conflict = detectContractConflicts(contract).find((item) => item.severity === "blocking");
   if (conflict) {
     const key = conflict.fields.at(-1) ?? conflict.fields[0];
     const field = contract.fields[key];
@@ -583,7 +612,7 @@ function collectInputValues(contract: StrategyContract, input: string): Array<{ 
     if (contract.fields[key]) values.push({ key, value, label });
   };
 
-  if (/A\s*股|沪深|股票/.test(input)) add("market", "A 股", "市场：A 股");
+  if (/A\s*股|沪深|股票/i.test(input)) add("market", "A 股", "市场：A 股");
   if (!/(不要|不选|排除).{0,5}沪深\s*300/.test(input) && /沪深\s*300/.test(input)) add("universe", "沪深 300", "股票池：沪深 300");
   if (!/(不要|不选|排除).{0,5}中证\s*500/.test(input) && /中证\s*500/.test(input)) add("universe", "中证 500", "股票池：中证 500");
   if (/全\s*A\s*股/.test(input)) add("universe", "全 A 股", "股票池：全 A 股");
